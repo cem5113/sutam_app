@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-# serve.py — SUTAM tahmin çekirdeği (stacking binary + multiclass)
+# serve.py — SUTAM tahmin çekirdeği (binary + multiclass, otomatik model seçimi)
 from __future__ import annotations
 
 import os
 from functools import lru_cache
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 
 import joblib
@@ -13,68 +13,98 @@ import pandas as pd
 
 
 # =========================
-# 1) Model yükleme (güvenli)
+# 0) Ayarlar
 # =========================
-
 MODELS_DIR = os.environ.get("SUTAM_MODELS_DIR", "models")
 
-@lru_cache(maxsize=1)
-def _load_models():
-    """Modelleri ve meta bilgileri yükler; bulunamazsa açıklayıcı hata verir."""
-    try:
-        bin_path = os.path.join(MODELS_DIR, "sutam_binary_stack_cal.joblib")
-        cat_path = os.path.join(MODELS_DIR, "sutam_category_lgbm.joblib")
-        bin_meta = os.path.join(MODELS_DIR, "binary_meta.pkl")
-        cat_meta = os.path.join(MODELS_DIR, "category_meta.pkl")
+BIN_NAME = "sutam_binary_stack_cal.joblib"
+BIN_META = "binary_meta.pkl"
 
+# Kategori için sıralı arama (hangisi varsa onu yükle)
+CAT_CANDIDATES = [
+    "sutam_category_xgb.joblib",   # önerilen
+    "sutam_category_lgbm.joblib",  # alternatif
+]
+CAT_META = "category_meta.pkl"
+
+
+# =========================
+# 1) Model yükleme (güvenli)
+# =========================
+def _first_existing(paths: List[str]) -> str:
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(" / ".join(paths))
+
+@lru_cache(maxsize=1)
+def _load_models() -> Tuple[object, object, List[str], List[str], List[str]]:
+    """
+    Modelleri ve meta bilgileri yükler; bulunamazsa açıklayıcı hata verir.
+    Dönüş:
+      BIN, CAT, BIN_COLS, CAT_COLS, CAT_CLASSES
+    """
+    try:
+        bin_path = os.path.join(MODELS_DIR, BIN_NAME)
+        cat_path = _first_existing([os.path.join(MODELS_DIR, n) for n in CAT_CANDIDATES])
+
+        bin_meta_path = os.path.join(MODELS_DIR, BIN_META)
+        cat_meta_path = os.path.join(MODELS_DIR, CAT_META)
+
+        # Yükleme
         BIN = joblib.load(bin_path)
         CAT = joblib.load(cat_path)
-        BIN_META = joblib.load(bin_meta)
-        CAT_META = joblib.load(cat_meta)
 
-        BIN_COLS = list(BIN_META["columns"])
-        CAT_COLS = list(CAT_META["columns"])
-        CAT_CLASSES = list(CAT_META["classes"])
+        BIN_META_OBJ = joblib.load(bin_meta_path)
+        CAT_META_OBJ = joblib.load(cat_meta_path)
+
+        # Meta alanları
+        BIN_COLS = list(BIN_META_OBJ.get("columns", []))
+        CAT_COLS = list(CAT_META_OBJ.get("columns", []))
+        CAT_CLASSES = list(CAT_META_OBJ.get("classes", []))
+
+        if not BIN_COLS or not CAT_COLS or not CAT_CLASSES:
+            raise ValueError("Meta dosyalarında beklenen anahtarlar yok: columns/classes")
+
         return BIN, CAT, BIN_COLS, CAT_COLS, CAT_CLASSES
+
     except Exception as e:
         raise RuntimeError(
             "Modeller yüklenemedi. 'models/' dizininde aşağıdakilerin olduğundan emin olun:\n"
-            " - sutam_binary_stack_cal.joblib\n"
-            " - binary_meta.pkl\n"
-            " - sutam_category_lgbm.joblib\n"
-            " - category_meta.pkl\n"
+            f" - {BIN_NAME}\n"
+            f" - {BIN_META}\n"
+            f" - ({' veya '.join(CAT_CANDIDATES)})\n"
+            f" - {CAT_META}\n"
             f"Orijinal hata: {e}"
         )
 
 
 # =========================
-# 2) Yardımcılar
+# 2) Yardımcılar (tip/sızıntı/hizalama)
 # =========================
-
 def _ensure_types(df: pd.DataFrame) -> pd.DataFrame:
-    """Tahminden önce temel tip/kısıt düzeltmeleri."""
+    """Temel tip/kısıt düzeltmeleri."""
     out = df.copy()
     if "GEOID" in out.columns:
         out["GEOID"] = out["GEOID"].astype(str)
     if "event_hour" in out.columns:
         out["event_hour"] = pd.to_numeric(out["event_hour"], errors="coerce").fillna(-1).astype(int)
-    # date string olabilir; filtreleme için aynı formatı kullanacağız
     if "date" in out.columns:
         out["date"] = out["date"].astype(str)
     return out
 
 def _filter_history_t_minus_1(df: pd.DataFrame, when: datetime) -> pd.DataFrame:
-    """t−1 kuralı: 'when' tarih/saatinden SONRAKİ satırları kesinlikle kullanma."""
+    """
+    t−1 kuralı: 'when' tarihinden SONRAKİ satırları kesinlikle dışla.
+    Varsayım: 'date' gün seviyesinde (YYYY-MM-DD), saat için 'event_hour' var.
+    """
     if "date" not in df.columns:
-        # Tarih yoksa olduğu gibi döndür (sızıntı korunamayabilir — veri modelleri öyleyse)
         return df
-    # 'date' gün bazında tutuluyor diye varsayıyoruz (HH olmadan). Saat için event_hour var.
-    # when.date()'e kadar olan satırları al (<= t-1 gün).
     cutoff_day = when.date().isoformat()
     return df[df["date"] <= cutoff_day].copy()
 
-def _last_row_for_hour(df: pd.DataFrame, geoid: str, hour: int) -> pd.Series | None:
-    """Aynı GEOID & hour için en yakın geçmiş satır; yoksa GEOID'in en son satırı."""
+def _last_row_for_hour(df: pd.DataFrame, geoid: str, hour: int) -> Optional[pd.Series]:
+    """Aynı GEOID & event_hour için en yakın geçmiş satır; yoksa GEOID’in en son satırı."""
     g = df[df["GEOID"].astype(str) == str(geoid)]
     if g.empty:
         return None
@@ -82,11 +112,10 @@ def _last_row_for_hour(df: pd.DataFrame, geoid: str, hour: int) -> pd.Series | N
         gh = g[g["event_hour"] == int(hour)]
         if not gh.empty:
             return gh.sort_values("date").iloc[-1]
-    # yedek: GEOID için en son satır
     return g.sort_values("date").iloc[-1]
 
 def _row_to_aligned_frames(row: pd.Series, bin_cols: List[str], cat_cols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Eğitimde kullanılan kolon isimlerine göre tek satırlık DataFrame üretir (eksikler NaN)."""
+    """Eğitimde kullanılan kolon isimlerine göre tek-satır X_bin ve X_cat üretir (eksikler NaN)."""
     xb = pd.DataFrame([{c: (row[c] if c in row.index else np.nan) for c in bin_cols}])
     xc = pd.DataFrame([{c: (row[c] if c in row.index else np.nan) for c in cat_cols}])
 
@@ -105,16 +134,14 @@ def _row_to_aligned_frames(row: pd.Series, bin_cols: List[str], cat_cols: List[s
 # =========================
 # 3) Feature build + Tahmin
 # =========================
-
 def build_features_point(history_df: pd.DataFrame, geoid: str, when: datetime) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     'history_df' = t−1'e kadar olan veri (sızıntısız).
-    Strateji:
-      1) 'when' gününden SONRAKİ satırları at
+      1) when gününden SONRAKİ satırları at
       2) aynı GEOID & event_hour için en son satır; yoksa GEOID için en son satır
-      3) eğitim kolonlarıyla hizalanmış tek satırlık X_bin ve X_cat döndür
+      3) eğitim kolonlarıyla hizalı tek satırlık X_bin ve X_cat döndür
     """
-    BIN, CAT, BIN_COLS, CAT_COLS, _ = _load_models()  # sadece kolon adları için
+    _, _, BIN_COLS, CAT_COLS, _ = _load_models()  # sadece kolon adları için
     h = _ensure_types(history_df)
     h = _filter_history_t_minus_1(h, when)
 
@@ -126,23 +153,27 @@ def build_features_point(history_df: pd.DataFrame, geoid: str, when: datetime) -
     return xb, xc
 
 def predict_point(history_df: pd.DataFrame, geoid: str, when: datetime) -> Dict:
-    """Tek GEOID & zaman için: P(Y=1) ve top-3 kategori joint olasılıkları."""
+    """
+    Tek GEOID & zaman için:
+      - p_occ  = P(Y=1) (ikili model)
+      - top3   = [(kategori, P(cat ∧ olay)), ...]
+    """
     BIN, CAT, _, _, CAT_CLASSES = _load_models()
     xb, xc = build_features_point(history_df, geoid, when)
 
     # Olasılıklar
-    p_occ = float(BIN.predict_proba(xb)[0, 1])
-    p_cat = CAT.predict_proba(xc)[0]  # multiclass dağılım
+    p_occ = float(BIN.predict_proba(xb)[0, 1])             # P(Y=1)
+    p_cat = np.array(CAT.predict_proba(xc)[0], dtype=float)  # P(cat | Y=1) gibi düşünülür
 
-    # Joint: P(cat ∧ olay) = P(Y=1) * P(cat | Y=1)
-    top = sorted([(str(CAT_CLASSES[i]), p_occ * float(p_cat[i])) for i in range(len(CAT_CLASSES))],
+    # Joint: P(cat ∧ olay) ≈ P(Y=1) * P(cat | Y=1)
+    top = sorted([(str(CAT_CLASSES[i]), p_occ * p_cat[i]) for i in range(len(CAT_CLASSES))],
                  key=lambda x: x[1], reverse=True)
 
     return {
         "geoid": str(geoid),
         "when": when.isoformat(),
         "p_occ": p_occ,
-        "top3": top[:3],  # (kategori, joint p)
+        "top3": top[:3],
     }
 
 def predict_many(history_df: pd.DataFrame, geoids: List[str], when: datetime) -> pd.DataFrame:
