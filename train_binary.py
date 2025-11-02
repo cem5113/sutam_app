@@ -4,11 +4,11 @@ from __future__ import annotations
 import argparse, joblib, pandas as pd, numpy as np
 from pathlib import Path
 
-from sklearn.model_selection import TimeSeriesSplit
+from sklearn.model_selection import StratifiedKFold   # <= TimeSeriesSplit yerine
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.pipeline import make_pipeline as skl_makepipe  # <-- alias
+from sklearn.pipeline import make_pipeline as skl_makepipe
 from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import average_precision_score
@@ -44,14 +44,13 @@ def load_df(path: str) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray
         "911_request_count_daily(before_24_hours)", "311_request_count",
         "wx_tavg", "wx_prcp"
     ] if c in df.columns]
-
     if not keep:
         raise SystemExit("Feature kolonları bulunamadı (keep listesi boş).")
 
     X = df[keep].copy()
     y = df["Y_label"].to_numpy()
 
-    # Zaman bazlı split: son %20 test
+    # Zaman bazlı holdout: son %20 test (dış holdout)
     df["_t"] = pd.to_datetime(df["date"], errors="coerce")
     cutoff = df["_t"].quantile(0.80)
     tr_idx = (df["_t"] < cutoff).to_numpy()
@@ -72,7 +71,6 @@ def build_pipeline(X: pd.DataFrame) -> Pipeline:
     # Numerik / kategorik ayrımı
     num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
     cat_cols = [c for c in X.columns if c not in num_cols]
-    # GEOID kategorik olsun
     if "GEOID" in num_cols:
         num_cols.remove("GEOID")
         cat_cols.append("GEOID")
@@ -82,7 +80,6 @@ def build_pipeline(X: pd.DataFrame) -> Pipeline:
         ("impute", SimpleImputer(strategy="median")),
     ])
 
-    # sklearn>=1.2: sparse_output; eski sürümde sparse kullanılıyor
     try:
         cat_enc = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
     except TypeError:
@@ -109,7 +106,6 @@ def build_pipeline(X: pd.DataFrame) -> Pipeline:
         random_state=42,
         n_jobs=-1,
     )
-
     xgb = XGBClassifier(
         n_estimators=400,
         max_depth=6,
@@ -122,32 +118,27 @@ def build_pipeline(X: pd.DataFrame) -> Pipeline:
         random_state=42,
         n_jobs=-1,
     )
+    base = [("lgbm", lgbm), ("xgb", xgb)]
 
-    base = [
-        ("lgbm", lgbm),
-        ("xgb",  xgb),
-    ]
-
-    # Meta (final) estimator: NaN güvenli pipeline
+    # Meta (final) estimator: NaN güvenli LR
     final_est = skl_makepipe(
         SimpleImputer(strategy="median"),
         LogisticRegression(max_iter=1000, class_weight="balanced", solver="lbfgs", random_state=42),
     )
 
+    # İç CV: partition garantili (cross_val_predict hatasını çözer)
+    cv_part = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
     stack = StackingClassifier(
         estimators=base,
-        final_estimator=final_est,   # <-- imputer'lı LR
+        final_estimator=final_est,
         passthrough=True,
-        cv=TimeSeriesSplit(n_splits=5),
+        cv=cv_part,
         n_jobs=-1,
         stack_method="predict_proba",
     )
 
-    clf = Pipeline([
-        ("pre", pre),
-        ("stack", stack),
-    ])
-    return clf
+    return Pipeline([("pre", pre), ("stack", stack)])
 
 
 def main(args):
@@ -172,7 +163,7 @@ def main(args):
     Path(args.outdir).mkdir(parents=True, exist_ok=True)
     joblib.dump(cal, f"{args.outdir}/sutam_binary_stack_cal.joblib")
     joblib.dump({"columns": X.columns.tolist()}, f"{args.outdir}/binary_meta.pkl")
-    print("✅ Kaydedildi: {args.outdir}/sutam_binary_stack_cal.joblib, {args.outdir}/binary_meta.pkl")
+    print(f"✅ Kaydedildi: {args.outdir}/sutam_binary_stack_cal.joblib, {args.outdir}/binary_meta.pkl")
 
 
 if __name__ == "__main__":
