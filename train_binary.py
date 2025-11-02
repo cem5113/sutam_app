@@ -7,7 +7,8 @@ from pathlib import Path
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.pipeline import Pipeline
+from sklearn.pipeline import make_pipeline as skl_makepipe  # <-- alias
 from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import average_precision_score
@@ -33,7 +34,7 @@ def load_df(path: str) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray
     df["GEOID"] = df["GEOID"].astype(str)
     df["date"] = df["date"].astype(str)
 
-    # Öznitelik seti (yalın ama güçlü, mevcut olana göre)
+    # Öznitelik seti (mevcut olana göre)
     keep = [c for c in [
         "GEOID", "event_hour", "day_of_week_x", "month_x", "season_x",
         "is_holiday", "is_weekend", "is_night", "is_school_hour", "is_business_hour",
@@ -59,7 +60,7 @@ def load_df(path: str) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray
     # Temizlik: inf → NaN
     X.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-    # Tümü NaN kolonları at (hem eğitim hem inference için güvenli)
+    # Tümü NaN kolonları at
     all_nan_cols = [c for c in X.columns if X[c].isna().all()]
     if all_nan_cols:
         X.drop(columns=all_nan_cols, inplace=True)
@@ -67,32 +68,37 @@ def load_df(path: str) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray
     return X, y, tr_idx, te_idx
 
 
-def make_pipeline(X: pd.DataFrame) -> Pipeline:
+def build_pipeline(X: pd.DataFrame) -> Pipeline:
     # Numerik / kategorik ayrımı
     num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
     cat_cols = [c for c in X.columns if c not in num_cols]
-    # GEOID objektif bir kategori
+    # GEOID kategorik olsun
     if "GEOID" in num_cols:
         num_cols.remove("GEOID")
         cat_cols.append("GEOID")
 
-    # Önişleme: NaN güvenli
+    # Önişleme (NaN güvenli)
     num_pipe = Pipeline([
         ("impute", SimpleImputer(strategy="median")),
-        # ("scale", StandardScaler(with_mean=False))  # istersen ekleyebilirsin
     ])
+
+    # sklearn>=1.2: sparse_output; eski sürümde sparse kullanılıyor
+    try:
+        cat_enc = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
+    except TypeError:
+        cat_enc = OneHotEncoder(handle_unknown="ignore", sparse=True)
 
     cat_pipe = Pipeline([
         ("impute", SimpleImputer(strategy="most_frequent")),
-        ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=True))
+        ("ohe", cat_enc),
     ])
 
     pre = ColumnTransformer([
         ("num", num_pipe, num_cols),
-        ("cat", cat_pipe, cat_cols)
+        ("cat", cat_pipe, cat_cols),
     ])
 
-    # Baz modeller (ikisi de NaN tolere eder; fakat pre-impute ile zaten temiz)
+    # Baz modeller
     lgbm = LGBMClassifier(
         n_estimators=300,
         learning_rate=0.05,
@@ -101,7 +107,7 @@ def make_pipeline(X: pd.DataFrame) -> Pipeline:
         colsample_bytree=0.8,
         class_weight="balanced",
         random_state=42,
-        n_jobs=-1
+        n_jobs=-1,
     )
 
     xgb = XGBClassifier(
@@ -114,32 +120,32 @@ def make_pipeline(X: pd.DataFrame) -> Pipeline:
         eval_metric="logloss",
         tree_method="hist",
         random_state=42,
-        n_jobs=-1
+        n_jobs=-1,
     )
 
     base = [
         ("lgbm", lgbm),
-        ("xgb",  xgb)
+        ("xgb",  xgb),
     ]
 
     # Meta (final) estimator: NaN güvenli pipeline
-    final_est = make_pipeline(
+    final_est = skl_makepipe(
         SimpleImputer(strategy="median"),
-        LogisticRegression(max_iter=1000, class_weight="balanced", solver="lbfgs", random_state=42)
+        LogisticRegression(max_iter=1000, class_weight="balanced", solver="lbfgs", random_state=42),
     )
 
     stack = StackingClassifier(
         estimators=base,
-        final_estimator=final_est,         # <-- imputer'lı LR (kritik)
+        final_estimator=final_est,   # <-- imputer'lı LR
         passthrough=True,
         cv=TimeSeriesSplit(n_splits=5),
         n_jobs=-1,
-        stack_method="predict_proba"
+        stack_method="predict_proba",
     )
 
     clf = Pipeline([
         ("pre", pre),
-        ("stack", stack)
+        ("stack", stack),
     ])
     return clf
 
@@ -148,7 +154,7 @@ def main(args):
     X, y, tr, te = load_df(args.input)
     print(f"[INFO] X shape={X.shape}, y={y.shape}, train={tr.sum()} test={te.sum()}")
 
-    clf = make_pipeline(X)
+    clf = build_pipeline(X)
 
     # Fit (train dilimi)
     clf.fit(X.iloc[tr], y[tr])
@@ -166,7 +172,7 @@ def main(args):
     Path(args.outdir).mkdir(parents=True, exist_ok=True)
     joblib.dump(cal, f"{args.outdir}/sutam_binary_stack_cal.joblib")
     joblib.dump({"columns": X.columns.tolist()}, f"{args.outdir}/binary_meta.pkl")
-    print("✅ Kaydedildi: models/sutam_binary_stack_cal.joblib, models/binary_meta.pkl")
+    print("✅ Kaydedildi: {args.outdir}/sutam_binary_stack_cal.joblib, {args.outdir}/binary_meta.pkl")
 
 
 if __name__ == "__main__":
