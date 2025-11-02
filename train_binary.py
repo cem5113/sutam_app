@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse, joblib, pandas as pd, numpy as np
 from pathlib import Path
 
-from sklearn.model_selection import StratifiedKFold   # <= TimeSeriesSplit yerine
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -19,47 +19,53 @@ from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 
 
+REQ_COLS = ["GEOID", "date", "event_hour", "Y_label", "latitude", "longitude"]
+FEATS = [
+    "GEOID","event_hour","day_of_week_x","month_x","season_x",
+    "is_holiday","is_weekend","is_night","is_school_hour","is_business_hour",
+    "poi_risk_score","poi_total_count","bus_stop_count","train_stop_count",
+    "distance_to_police","is_near_police","is_near_government",
+    "neighbor_crime_24h","neighbor_crime_72h","neighbor_crime_7d",
+    "911_request_count_daily(before_24_hours)","311_request_count",
+    "wx_tavg","wx_prcp"
+]
+
+
 def load_df(path: str) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray]:
     df = pd.read_parquet(path) if path.endswith(".parquet") else pd.read_csv(path)
 
-    # Zorunlu kolonlar
-    need = ["GEOID", "date", "event_hour", "Y_label", "latitude", "longitude"]
-    miss = [c for c in need if c not in df.columns]
+    # Zorunlu kolon kontrolü
+    miss = [c for c in REQ_COLS if c not in df.columns]
     if miss:
         raise SystemExit(f"Eksik kolonlar: {miss}")
 
     # Tipler
-    df["event_hour"] = pd.to_numeric(df["event_hour"], errors="coerce").fillna(0).astype("int16")
-    df["Y_label"] = pd.to_numeric(df["Y_label"], errors="coerce").fillna(0).astype("int8")
     df["GEOID"] = df["GEOID"].astype(str)
     df["date"] = df["date"].astype(str)
+    df["event_hour"] = pd.to_numeric(df["event_hour"], errors="coerce")
+    df["Y_label"] = pd.to_numeric(df["Y_label"], errors="coerce").fillna(0).astype("int8")
 
-    # Öznitelik seti (mevcut olana göre)
-    keep = [c for c in [
-        "GEOID", "event_hour", "day_of_week_x", "month_x", "season_x",
-        "is_holiday", "is_weekend", "is_night", "is_school_hour", "is_business_hour",
-        "poi_risk_score", "poi_total_count", "bus_stop_count", "train_stop_count",
-        "distance_to_police", "is_near_police", "is_near_government",
-        "neighbor_crime_24h", "neighbor_crime_72h", "neighbor_crime_7d",
-        "911_request_count_daily(before_24_hours)", "311_request_count",
-        "wx_tavg", "wx_prcp"
-    ] if c in df.columns]
+    if df["event_hour"].isna().any():
+        # çok az NaN varsa saat moduyla doldur
+        df["event_hour"] = df["event_hour"].fillna(df["event_hour"].mode(dropna=True).iloc[0])
+    df["event_hour"] = df["event_hour"].astype("int16")
+
+    # Feature seçimi (mevcutta olanlar)
+    keep = [c for c in FEATS if c in df.columns]
     if not keep:
         raise SystemExit("Feature kolonları bulunamadı (keep listesi boş).")
 
     X = df[keep].copy()
     y = df["Y_label"].to_numpy()
 
-    # Zaman bazlı holdout: son %20 test (dış holdout)
+    # Zaman bazlı dış holdout: son %20 test
     df["_t"] = pd.to_datetime(df["date"], errors="coerce")
     cutoff = df["_t"].quantile(0.80)
     tr_idx = (df["_t"] < cutoff).to_numpy()
     te_idx = (df["_t"] >= cutoff).to_numpy()
 
-    # Temizlik: inf → NaN
+    # Temizlik: inf -> NaN, tamamen NaN olan kolonları at
     X.replace([np.inf, -np.inf], np.nan, inplace=True)
-
-    # Tümü NaN kolonları at
     all_nan_cols = [c for c in X.columns if X[c].isna().all()]
     if all_nan_cols:
         X.drop(columns=all_nan_cols, inplace=True)
@@ -106,6 +112,7 @@ def build_pipeline(X: pd.DataFrame) -> Pipeline:
         random_state=42,
         n_jobs=-1,
     )
+
     xgb = XGBClassifier(
         n_estimators=400,
         max_depth=6,
@@ -118,15 +125,16 @@ def build_pipeline(X: pd.DataFrame) -> Pipeline:
         random_state=42,
         n_jobs=-1,
     )
+
     base = [("lgbm", lgbm), ("xgb", xgb)]
 
-    # Meta (final) estimator: NaN güvenli LR
+    # Meta (final) estimator: imputer'lı LR (NaN güvenli)
     final_est = skl_makepipe(
         SimpleImputer(strategy="median"),
         LogisticRegression(max_iter=1000, class_weight="balanced", solver="lbfgs", random_state=42),
     )
 
-    # İç CV: partition garantili (cross_val_predict hatasını çözer)
+    # İç CV: partition garantili (Stacking için gerekli)
     cv_part = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
     stack = StackingClassifier(
