@@ -1,0 +1,29 @@
+# .github/workflows/train.yml
+name: Train SUTAM Models
+
+on:
+  schedule:
+    - cron: "30 22 * * *"   # 01:30 Europe/Istanbul
+  workflow_dispatch: {}
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+      - name: Train models
+        run: |
+          python train_binary.py   --input data/fr_crime_09.parquet --outdir models
+          python train_category.py --input data/fr_crime_09.parquet --outdir models
+      - name: Commit models
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add models/*.joblib models/*.pkl
+          git commit -m "ci: update models ($(date -u +%F))" || echo "no changes"
+          git push
