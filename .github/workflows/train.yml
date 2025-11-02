@@ -7,7 +7,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write    # <-- commit/push için gerekli
+  contents: write
   actions: read
 
 jobs:
@@ -16,14 +16,16 @@ jobs:
     env:
       TZ: Europe/Istanbul
     steps:
-      - name: Checkout
+      - name: Checkout (with LFS)
         uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"   # pip cache
+          cache: "pip"
 
       - name: Install deps
         run: |
@@ -31,24 +33,40 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Sanity check input data
+      - name: Resolve input parquet (data/ or repo root)
+        id: resolve_input
+        shell: bash
         run: |
-          test -f "data/fr_crime_09.parquet" || { echo "data/fr_crime_09.parquet bulunamadı"; exit 1; }
-          ls -lh data/fr_crime_09.parquet
+          set -euo pipefail
+          if [[ -f "data/fr_crime_09.parquet" ]]; then
+            INPUT="data/fr_crime_09.parquet"
+          elif [[ -f "fr_crime_09.parquet" ]]; then
+            INPUT="fr_crime_09.parquet"
+          else
+            echo "❌ fr_crime_09.parquet bulunamadı (ne data/ altında ne de kökte)."
+            exit 1
+          fi
+          echo "✅ Using INPUT=$INPUT"
+          ls -lh "$INPUT"
+          echo "INPUT=$INPUT" >> "$GITHUB_ENV"
+
+      - name: Prepare output dir
+        run: |
+          mkdir -p models
 
       - name: Train binary model (stacking)
         run: |
-          python train_binary.py --input data/fr_crime_09.parquet --outdir models
+          python train_binary.py --input "$INPUT" --outdir models
 
       - name: Train category model (multiclass)
         run: |
-          python train_category.py --input data/fr_crime_09.parquet --outdir models
+          python train_category.py --input "$INPUT" --outdir models
 
       - name: Show outputs
         run: |
           ls -lh models
 
-      - name: Upload models as artifact (optional but recommended)
+      - name: Upload models as artifact
         uses: actions/upload-artifact@v4
         with:
           name: sutam-models
