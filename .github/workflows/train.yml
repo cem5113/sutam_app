@@ -3,27 +3,65 @@ name: Train SUTAM Models
 
 on:
   schedule:
-    - cron: "30 22 * * *"   # 01:30 Europe/Istanbul
+    - cron: "30 22 * * *"   # 01:30 Europe/Istanbul (UTC+3)
   workflow_dispatch: {}
+
+permissions:
+  contents: write    # <-- commit/push için gerekli
+  actions: read
 
 jobs:
   train:
     runs-on: ubuntu-latest
+    env:
+      TZ: Europe/Istanbul
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"   # pip cache
+
       - name: Install deps
         run: |
+          python -V
+          pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Train models
+
+      - name: Sanity check input data
         run: |
-          python train_binary.py   --input data/fr_crime_09.parquet --outdir models
+          test -f "data/fr_crime_09.parquet" || { echo "data/fr_crime_09.parquet bulunamadı"; exit 1; }
+          ls -lh data/fr_crime_09.parquet
+
+      - name: Train binary model (stacking)
+        run: |
+          python train_binary.py --input data/fr_crime_09.parquet --outdir models
+
+      - name: Train category model (multiclass)
+        run: |
           python train_category.py --input data/fr_crime_09.parquet --outdir models
-      - name: Commit models
+
+      - name: Show outputs
+        run: |
+          ls -lh models
+
+      - name: Upload models as artifact (optional but recommended)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sutam-models
+          path: |
+            models/*.joblib
+            models/*.pkl
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Commit models to repo
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add models/*.joblib models/*.pkl
+          git add models/*.joblib models/*.pkl || true
           git commit -m "ci: update models ($(date -u +%F))" || echo "no changes"
           git push
