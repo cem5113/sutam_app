@@ -1,16 +1,29 @@
-# train_category.py — Multiclass (XGBoost) — FULL REVIZE
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+train_category.py — SUTAM çok sınıflı kategori modeli (FULL REVIZE)
+- Girdi: fr_crime_09.parquet (veya CSV)
+- Yalnızca Y_label==1 (olay) satırları ile kategori sınıflandırması
+- Nadir sınıfları 'Other' altında birleştirme (eşik: --rare-threshold)
+- Zaman-bazlı ayrım (leakage-safe): son %20 test
+- OHE uyumluluğu (sklearn >=1.2 ve <1.2)
+- XGBoost (multi:softprob) + sınıf dengesizliği için örnek ağırlıkları
+- Metrikler: macro F1, accuracy@1, accuracy@3, logloss; sınıf raporu
+- Çıktılar: sutam_category_xgb.joblib, category_meta.pkl, metrics_category.json, report_category.csv
+"""
 from __future__ import annotations
-import argparse, joblib, pandas as pd, numpy as np
+import argparse, json
 from pathlib import Path
 
+import joblib
+import numpy as np
+import pandas as pd
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.pipeline import make_pipeline as skl_makepipe
 from sklearn.impute import SimpleImputer
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+from sklearn.metrics import f1_score, log_loss, classification_report
 
 from xgboost import XGBClassifier
 
@@ -24,16 +37,25 @@ FEATS = [
     "wx_tavg","wx_prcp"
 ]
 
-def load_df(path: str, rare_threshold: int = 50):
-    df = pd.read_parquet(path) if path.endswith(".parquet") else pd.read_csv(path)
 
-    # sadece olay olan satırlar
+def _onehot():
+    try:
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=True)
+    except TypeError:
+        return OneHotEncoder(handle_unknown="ignore", sparse=True)
+
+
+def load_df(path: str, rare_threshold: int = 50):
+    df = pd.read_parquet(path) if path.lower().endswith((".parquet", ".pq")) else pd.read_csv(path)
+
+    # yalnız olaylar
     df["Y_label"] = pd.to_numeric(df["Y_label"], errors="coerce").fillna(0).astype("int8")
     df = df[df["Y_label"] == 1].copy()
 
     need = ["GEOID","date","event_hour","category","latitude","longitude"]
     miss = [c for c in need if c not in df.columns]
-    if miss: raise SystemExit(f"Eksik kolonlar: {miss}")
+    if miss:
+        raise SystemExit(f"Eksik kolonlar: {miss}")
 
     df["GEOID"] = df["GEOID"].astype(str)
     df["date"] = df["date"].astype(str)
@@ -46,44 +68,39 @@ def load_df(path: str, rare_threshold: int = 50):
     X = df[keep].copy()
     y = df["category"].astype(str).to_numpy()
 
-    # sınıf birleştirme (nadirler -> "Other")
+    # nadirleri Other'a al
     vc = pd.Series(y).value_counts()
     rare = set(vc[vc < rare_threshold].index)
     if rare:
         y = np.array([lbl if lbl not in rare else "Other" for lbl in y])
 
-    # NaN/∞ temizlik + düşük varyans filtre
+    # temizlik
     X.replace([np.inf, -np.inf], np.nan, inplace=True)
     all_nan = [c for c in X.columns if X[c].isna().all()]
     if all_nan:
         X.drop(columns=all_nan, inplace=True)
 
-    low_var = []
-    for c in X.columns:
-        vc = X[c].value_counts(dropna=False, normalize=True)
-        if vc.shape[0] <= 1 or (vc.iloc[0] >= 0.995):  # %99.5 tek değer
-            low_var.append(c)
-    if low_var:
-        X.drop(columns=low_var, inplace=True)
+    # zaman-bazlı bölme (son %20 test)
+    t = pd.to_datetime(df["date"], errors="coerce")
+    cutoff = t.quantile(0.80)
+    tr_mask = (t < cutoff).to_numpy()
+    te_mask = (t >= cutoff).to_numpy()
 
-    return X, y
+    return X, y, tr_mask, te_mask, cutoff
 
-def build_pipeline(X: pd.DataFrame) -> Pipeline:
+
+def build_pipeline(X: pd.DataFrame, random_state: int = 42) -> Pipeline:
     num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
     cat_cols = [c for c in X.columns if c not in num_cols]
     if "GEOID" in num_cols:
-        num_cols.remove("GEOID"); cat_cols.append("GEOID")
+        num_cols.remove("GEOID")
+        cat_cols.append("GEOID")
 
     num_pipe = Pipeline([("impute", SimpleImputer(strategy="median"))])
-    try:
-        ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
-    except TypeError:
-        ohe = OneHotEncoder(handle_unknown="ignore", sparse=True)
-    cat_pipe = Pipeline([("impute", SimpleImputer(strategy="most_frequent")), ("ohe", ohe)])
+    cat_pipe = Pipeline([("impute", SimpleImputer(strategy="most_frequent")), ("ohe", _onehot())])
 
     pre = ColumnTransformer([("num", num_pipe, num_cols), ("cat", cat_pipe, cat_cols)])
 
-    # XGBoost multiclass — stabil ve hızlı
     xgb = XGBClassifier(
         objective="multi:softprob",
         n_estimators=700,
@@ -93,36 +110,95 @@ def build_pipeline(X: pd.DataFrame) -> Pipeline:
         colsample_bytree=0.9,
         reg_lambda=1.0,
         tree_method="hist",
-        random_state=42,
+        random_state=random_state,
         n_jobs=-1,
     )
 
     return Pipeline([("pre", pre), ("clf", xgb)])
 
+
+def _class_weights(y: np.ndarray) -> dict:
+    # sınıf frekansına göre ters orantılı ağırlık
+    vc = pd.Series(y).value_counts()
+    total = float(len(y))
+    weights = {cls: total / (len(vc) * float(cnt)) for cls, cnt in vc.items()}
+    return weights
+
+
+def _topk_acc(y_true: np.ndarray, proba: np.ndarray, classes: list[str], k: int = 3) -> float:
+    cls_index = {c: i for i, c in enumerate(classes)}
+    true_idx = np.array([cls_index[c] for c in y_true])
+    topk = np.argsort(proba, axis=1)[:, -k:]
+    hits = (topk == true_idx.reshape(-1, 1)).any(axis=1)
+    return float(hits.mean())
+
+
 def main(args):
-    X, y = load_df(args.input, rare_threshold=args.rare_threshold)
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+    X, y, tr, te, cutoff = load_df(args.input, rare_threshold=args.rare_threshold)
+    print(f"[INFO] X={X.shape}, y={y.shape}, train={tr.sum()} test={te.sum()} (cutoff={cutoff.date()})")
+
+    pipe = build_pipeline(X, random_state=args.seed)
+
+    # sınıf ağırlığı → örnek ağırlığına çevir (XGBoost çok-sınıflı için)
+    wmap = _class_weights(y[tr])
+    sample_weight = np.array([wmap[c] for c in y[tr]])
+
+    pipe.fit(X.iloc[tr], y[tr], clf__sample_weight=sample_weight)
+
+    # Tahmin/olasılık
+    y_hat = pipe.predict(X.iloc[te])
+    y_proba = pipe.predict_proba(X.iloc[te])
+    classes = list(pipe.named_steps["clf"].classes_)
+
+    # Metrikler
+    f1_macro = f1_score(y[te], y_hat, average="macro")
+    acc1 = float((y_hat == y[te]).mean())
+    acc3 = _topk_acc(y[te], y_proba, classes, k=3) if y_proba.shape[1] >= 3 else acc1
+    ll = log_loss(y[te], y_proba, labels=classes)
+
+    print(f"[Category] macro F1={f1_macro:.4f} | acc@1={acc1:.4f} | acc@3={acc3:.4f} | logloss={ll:.4f}")
+    report_df = pd.DataFrame.from_dict(
+        json.loads(classification_report(y[te], y_hat, output_dict=True)),
+        orient="index"
     )
 
-    pipe = build_pipeline(X)
-    pipe.fit(X_tr, y_tr)
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
-    y_pred = pipe.predict(X_te)
-    print(classification_report(y_te, y_pred, digits=4))
+    # Model
+    joblib.dump(pipe, outdir / "sutam_category_xgb.joblib")
 
-    Path(args.outdir).mkdir(parents=True, exist_ok=True)
-    joblib.dump(pipe, f"{args.outdir}/sutam_category_xgb.joblib")
-    meta = {"columns": X.columns.tolist(),
-            "classes": sorted(pd.Series(y).unique().tolist())}
-    joblib.dump(meta, f"{args.outdir}/category_meta.pkl")
+    # Meta
+    meta = {"columns": X.columns.tolist(), "classes": classes, "cutoff_date": str(cutoff.date())}
+    joblib.dump(meta, outdir / "category_meta.pkl")
 
-    print(f"✅ Kaydedildi: {args.outdir}/sutam_category_xgb.joblib, {args.outdir}/category_meta.pkl")
+    # Raporlar
+    metrics = {
+        "f1_macro": float(f1_macro),
+        "acc_top1": float(acc1),
+        "acc_top3": float(acc3),
+        "logloss": float(ll),
+        "n_train": int(tr.sum()),
+        "n_test": int(te.sum()),
+        "pos_frac": 1.0,  # yalnız Y=1 altkümesi kullanıldı
+        "cutoff_date": str(cutoff.date()),
+        "seed": int(args.seed),
+        "rare_threshold": int(args.rare_threshold),
+    }
+    pd.Series(metrics).to_json(outdir / "metrics_category.json", indent=2)
+    report_df.to_csv(outdir / "report_category.csv")
+
+    print("✅ Kaydedildi:")
+    print(" -", outdir / "sutam_category_xgb.joblib")
+    print(" -", outdir / "category_meta.pkl")
+    print(" -", outdir / "metrics_category.json")
+    print(" -", outdir / "report_category.csv")
+
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--outdir", default="models")
-    ap.add_argument("--rare-threshold", type=int, default=50,
-                    help="Bu sayıdan az örneği olan sınıfları 'Other' yapar.")
+    ap.add_argument("--rare-threshold", type=int, default=50, help="Bu sayıdan az örneği olan sınıfları 'Other' yapar.")
+    ap.add_argument("--seed", type=int, default=42)
     main(ap.parse_args())
