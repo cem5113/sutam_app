@@ -1,31 +1,43 @@
-# .github/workflows/train.yml
 name: Train SUTAM Models
 
 on:
   schedule:
-    - cron: "30 22 * * *"   # 01:30 Europe/Istanbul (UTC+3)
-  workflow_dispatch: {}
+    # 07:30 America/Los_Angeles (San Francisco) = 15:30 UTC
+    - cron: "30 15 * * *"
+  workflow_dispatch:
+    inputs:
+      input_path:
+        description: "İsteğe bağlı özel girdi yolu (örn. data/fr_crime_09.parquet)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
   actions: read
+
+concurrency:
+  group: sutam-train-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   train:
     runs-on: ubuntu-latest
     env:
       TZ: Europe/Istanbul
+
     steps:
       - name: Checkout (with LFS)
         uses: actions/checkout@v4
         with:
           lfs: true
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
+          cache-dependency-path: "requirements.txt"
 
       - name: Install deps
         run: |
@@ -33,26 +45,34 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Resolve input parquet (data/ or repo root)
+      - name: Resolve input parquet (inputs → data/ → root → latest glob)
         id: resolve_input
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -f "data/fr_crime_09.parquet" ]]; then
+          REQ_INPUT="${{ github.event.inputs.input_path }}"
+          if [[ -n "${REQ_INPUT}" && -f "${REQ_INPUT}" ]]; then
+            INPUT="${REQ_INPUT}"
+          elif [[ -f "data/fr_crime_09.parquet" ]]; then
             INPUT="data/fr_crime_09.parquet"
           elif [[ -f "fr_crime_09.parquet" ]]; then
             INPUT="fr_crime_09.parquet"
           else
-            echo "❌ fr_crime_09.parquet bulunamadı (ne data/ altında ne de kökte)."
-            exit 1
+            # Son çare: data/ altında fr_crime_*.parquet içinden en güncel/versiyon en büyük olan
+            CANDIDATE="$(ls -1 data/fr_crime_*.parquet 2>/dev/null | sort -V | tail -n1 || true)"
+            if [[ -n "${CANDIDATE}" && -f "${CANDIDATE}" ]]; then
+              INPUT="${CANDIDATE}"
+            else
+              echo "❌ fr_crime_09.parquet bulunamadı (inputs/data/ veya kök)."
+              exit 1
+            fi
           fi
-          echo "✅ Using INPUT=$INPUT"
-          ls -lh "$INPUT"
-          echo "INPUT=$INPUT" >> "$GITHUB_ENV"
+          echo "✅ Using INPUT=${INPUT}"
+          ls -lh "${INPUT}"
+          echo "INPUT=${INPUT}" >> "$GITHUB_ENV"
 
       - name: Prepare output dir
-        run: |
-          mkdir -p models
+        run: mkdir -p models
 
       - name: Train binary model (stacking)
         run: |
@@ -64,22 +84,36 @@ jobs:
 
       - name: Show outputs
         run: |
-          ls -lh models
+          echo "📦 models/"
+          ls -lah models || true
 
-      - name: Upload models as artifact
+      - name: Upload models & reports as artifact
         uses: actions/upload-artifact@v4
         with:
           name: sutam-models
           path: |
             models/*.joblib
             models/*.pkl
-          if-no-files-found: error
+            models/*.json
+            models/*.csv
+            models/*.txt
+            models/*.log
+          if-no-files-found: warn
           retention-days: 7
 
-      - name: Commit models to repo
+      # Koşullu repo commit: yalnızca branch koşullarında ve değişiklik varsa
+      - name: Commit models to repo (conditional)
+        if: startsWith(github.ref, 'refs/heads/')
+        shell: bash
         run: |
+          set -euo pipefail
+          # İsteğe bağlı: LFS ile takip etmek isterseniz .gitattributes'ı repoda tanımlayın.
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add models/*.joblib models/*.pkl || true
-          git commit -m "ci: update models ($(date -u +%F))" || echo "no changes"
-          git push
+          git add models/*.joblib models/*.pkl 2>/dev/null || true
+          if ! git diff --quiet --cached; then
+            git commit -m "ci: update models ($(date -u +%F))"
+            git push
+          else
+            echo "ℹ️ No model changes to commit."
+          fi
