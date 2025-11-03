@@ -1,32 +1,41 @@
-name: Train SUTAM Models
+name: Daily Crime (1→9) — robust
 
 on:
-  schedule:
-    # 07:30 America/Los_Angeles (San Francisco) = 15:30 UTC
-    - cron: "30 15 * * *"
   workflow_dispatch:
     inputs:
-      input_path:
-        description: "İsteğe bağlı özel girdi yolu (örn. data/fr_crime_09.parquet)"
-        required: false
-        default: ""
+      persist:
+        description: "Çıktılar nasıl saklansın?"
+        type: choice
+        options: [artifact, commit, none]
+        default: artifact
+  schedule:
+    # Örnek: 07:30 Europe/Istanbul ≈ 04:30 UTC
+    - cron: "30 04 * * *"
 
 permissions:
-  contents: write
+  contents: write   # commit opsiyonu için gerekli
   actions: read
 
 concurrency:
-  group: sutam-train-${{ github.ref }}
+  group: daily-1-9-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  TZ: Europe/Istanbul
+  CRIME_DATA_DIR: crime_prediction_data
+  GEOID_LEN: "11"
+  # Günlük özet script'in için varsayılanlar (istersen değiştir)
+  FR_DAILY_IN:  "fr_crime.csv"
+  FR_DAILY_OUT: "fr_crime_daily.csv"
+  FR_DAILY_TZ:  "UTC"
+
 jobs:
-  train:
+  daily_pipeline:
     runs-on: ubuntu-latest
-    env:
-      TZ: Europe/Istanbul
 
     steps:
-      - name: Checkout (with LFS)
+      # ---------- Setup ----------
+      - name: Checkout repo (with LFS)
         uses: actions/checkout@v4
         with:
           lfs: true
@@ -37,83 +46,141 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
-          cache-dependency-path: "requirements.txt"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
-      - name: Install deps
+      - name: Install Python deps
         run: |
+          set -euo pipefail
           python -V
           pip install --upgrade pip
-          pip install -r requirements.txt
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          else
+            # Fallback (gerekiyorsa genişlet)
+            pip install pandas numpy pyarrow requests geopandas
+          fi
 
-      - name: Resolve input parquet (inputs → data/ → root → latest glob)
-        id: resolve_input
+      - name: Show environment
+        run: |
+          set -euo pipefail
+          echo "PWD: $(pwd)"
+          echo "PYTHON: $(python -V)"
+          echo "TZ: ${TZ}"
+          echo "CRIME_DATA_DIR: ${CRIME_DATA_DIR}"
+          echo "GEOID_LEN: ${GEOID_LEN}"
+          ls -lah
+
+      # ---------- Data update ----------
+      - name: Update crime data (logs to file)
+        id: update_crime
         shell: bash
         run: |
           set -euo pipefail
-          REQ_INPUT="${{ github.event.inputs.input_path }}"
-          if [[ -n "${REQ_INPUT}" && -f "${REQ_INPUT}" ]]; then
-            INPUT="${REQ_INPUT}"
-          elif [[ -f "data/fr_crime_09.parquet" ]]; then
-            INPUT="data/fr_crime_09.parquet"
-          elif [[ -f "fr_crime_09.parquet" ]]; then
-            INPUT="fr_crime_09.parquet"
-          else
-            # Son çare: data/ altında fr_crime_*.parquet içinden en güncel/versiyon en büyük olan
-            CANDIDATE="$(ls -1 data/fr_crime_*.parquet 2>/dev/null | sort -V | tail -n1 || true)"
-            if [[ -n "${CANDIDATE}" && -f "${CANDIDATE}" ]]; then
-              INPUT="${CANDIDATE}"
-            else
-              echo "❌ fr_crime_09.parquet bulunamadı (inputs/data/ veya kök)."
-              exit 1
+          LOG_DIR="logs"
+          mkdir -p "${LOG_DIR}"
+          echo "▶️ update_crime.py starting..."
+          { time python update_crime.py ; } 2>&1 | tee "${LOG_DIR}/update_crime.log"
+          echo "✅ update_crime.py done."
+
+      - name: Validate update outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "🔎 Validating likely outputs..."
+          # Burayı kendi pipeline'ına göre özelleştir:
+          # Örn: sf_crime.csv veya fr_crime.csv/… dosyalarını bekliyorsan kontrol et.
+          found=0
+          for f in sf_crime.csv fr_crime.csv data/sf_crime.csv data/fr_crime.csv; do
+            if [[ -f "$f" ]]; then
+              echo "• Found: $f"
+              found=1
             fi
+          done
+          if [[ $found -eq 0 ]]; then
+            echo "❌ Beklenen ana suç dosyası bulunamadı (sf_crime.csv / fr_crime.csv)."
+            echo "   Not: update_crime.py çıktılarının adını/yerini yukarıdaki listeye ekleyin."
+            exit 1
           fi
-          echo "✅ Using INPUT=${INPUT}"
-          ls -lh "${INPUT}"
-          echo "INPUT=${INPUT}" >> "$GITHUB_ENV"
+          echo "✅ Validation OK."
 
-      - name: Prepare output dir
-        run: mkdir -p models
-
-      - name: Train binary model (stacking)
+      # ---------- Daily aggregates ----------
+      - name: Build daily aggregates (logs to file)
+        id: daily_aggr
+        shell: bash
         run: |
-          python train_binary.py --input "$INPUT" --outdir models
+          set -euo pipefail
+          LOG_DIR="logs"
+          mkdir -p "${LOG_DIR}"
+          echo "▶️ update_crime_day.py starting..."
+          { time python update_crime_day.py ; } 2>&1 | tee "${LOG_DIR}/update_crime_day.log"
+          echo "✅ update_crime_day.py done."
 
-      - name: Train category model (multiclass)
+      - name: Validate daily outputs
+        shell: bash
         run: |
-          python train_category.py --input "$INPUT" --outdir models
+          set -euo pipefail
+          echo "🔎 Validating daily output..."
+          if [[ -f "${FR_DAILY_OUT}" ]]; then
+            echo "• Found: ${FR_DAILY_OUT}"
+          elif [[ -f "sf_crime_daily.csv" ]]; then
+            echo "• Found: sf_crime_daily.csv"
+          else
+            echo "❌ Günlük çıktı dosyası bulunamadı (${FR_DAILY_OUT} veya sf_crime_daily.csv)."
+            exit 1
+          fi
+          echo "✅ Daily validation OK."
 
-      - name: Show outputs
+      # ---------- Quick peek ----------
+      - name: Show head/tail of key files
+        shell: bash
         run: |
-          echo "📦 models/"
-          ls -lah models || true
+          set -euo pipefail
+          for f in \
+            sf_crime.csv fr_crime.csv data/sf_crime.csv data/fr_crime.csv \
+            "${FR_DAILY_OUT}" sf_crime_daily.csv ; do
+            if [[ -f "$f" ]]; then
+              echo "------ $f (head) ------"
+              head -n 5 "$f" || true
+              echo "------ $f (tail) ------"
+              tail -n 5 "$f" || true
+            fi
+          done
 
-      - name: Upload models & reports as artifact
+      # ---------- Package artifacts ----------
+      - name: Upload artifacts (CSVs/Parquets + logs)
         uses: actions/upload-artifact@v4
         with:
-          name: sutam-models
+          name: daily-crime-artifacts
           path: |
-            models/*.joblib
-            models/*.pkl
-            models/*.json
-            models/*.csv
-            models/*.txt
-            models/*.log
+            *.csv
+            *.parquet
+            data/*.csv
+            data/*.parquet
+            logs/*.log
           if-no-files-found: warn
           retention-days: 7
 
-      # Koşullu repo commit: yalnızca branch koşullarında ve değişiklik varsa
-      - name: Commit models to repo (conditional)
-        if: startsWith(github.ref, 'refs/heads/')
+      # ---------- Optional commit ----------
+      - name: Commit updated CSVs (conditional)
+        if: ${{ github.event.inputs.persist == 'commit' && startsWith(github.ref, 'refs/heads/') }}
         shell: bash
         run: |
           set -euo pipefail
-          # İsteğe bağlı: LFS ile takip etmek isterseniz .gitattributes'ı repoda tanımlayın.
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add models/*.joblib models/*.pkl 2>/dev/null || true
+          # Burayı istediğin kalıplara göre genişlet
+          git add *.csv data/*.csv 2>/dev/null || true
           if ! git diff --quiet --cached; then
-            git commit -m "ci: update models ($(date -u +%F))"
+            git commit -m "ci: daily crime update ($(date -u +%F))"
             git push
           else
-            echo "ℹ️ No model changes to commit."
-          fi
+            echo "ℹ️ No CSV changes to commit."
+
+      # ---------- Done ----------
+      - name: Final listing
+        run: |
+          set -euo pipefail
+          echo "📦 Final tree:"
+          ls -lah
